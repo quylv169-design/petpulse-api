@@ -37,7 +37,6 @@ function profileBlock(p = {}) {
 /**
  * OpenAI Responses API helper
  * NOTE: OpenAI changed `response_format` -> `text.format`
- * We now pass the json_schema under `text.format`.
  */
 async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-mini" }) {
   mustEnv();
@@ -48,7 +47,6 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    // ✅ NEW: structured output lives under text.format (NOT response_format)
     text: {
       format: {
         type: "json_schema",
@@ -71,7 +69,7 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
   const text = await res.text();
 
   if (!res.ok) {
-    throw new Error(`OpenAI error ${res.status}: ${text.slice(0, 500)}`);
+    throw new Error(`OpenAI error ${res.status}: ${text.slice(0, 800)}`);
   }
 
   let json;
@@ -81,12 +79,7 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
     throw new Error(`Could not parse OpenAI response JSON envelope: ${e}`);
   }
 
-  // Responses API: prefer output_text; fallback to first message content text
-  const outputText =
-    json?.output_text ||
-    json?.output?.[0]?.content?.[0]?.text ||
-    "";
-
+  const outputText = json?.output_text || json?.output?.[0]?.content?.[0]?.text || "";
   if (!outputText || typeof outputText !== "string") {
     throw new Error("OpenAI returned empty structured output.");
   }
@@ -94,11 +87,12 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
   try {
     return JSON.parse(outputText);
   } catch (e) {
-    throw new Error(
-      `Could not parse structured JSON result: ${e}. Raw: ${outputText.slice(0, 400)}`
-    );
+    throw new Error(`Could not parse structured JSON result: ${e}. Raw: ${outputText.slice(0, 600)}`);
   }
 }
+
+// ---------- constants ----------
+const STEP1_LEVELS = ["NHE", "TRUNGBINH", "KHA_NANG", "NANG", "KHAN_CAP"]; // for badges in Step 1
 
 // ---------- routes ----------
 app.get("/health", (req, res) => res.status(200).send("ok"));
@@ -117,9 +111,10 @@ app.post("/tips", async (req, res) => {
 
     const system = `
 You are a calm, friendly veterinary assistant.
-You do NOT diagnose. You use cautious language: may/could/possible.
-You reduce anxiety and help the owner decide next actions.
-Never claim certainty. Never use alarming tone.
+You do NOT diagnose. You avoid certainty.
+Use cautious language: may / could / possible / consistent with.
+Your goal is to reduce anxiety and help the owner decide next steps.
+Never use alarming tone unless describing clear red flags, and still stay calm.
     `.trim();
 
     const schema = {
@@ -137,11 +132,12 @@ Never claim certainty. Never use alarming tone.
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["id", "title", "urgency", "why", "do_today", "watch"],
+            required: ["id", "title", "level", "why", "do_today", "watch"],
             properties: {
               id: { type: "string" },
               title: { type: "string" }, // must include "(possible)"
-              urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
+              // ✅ NEW: 5-level badge for Step 1 (concern level, not action)
+              level: { type: "string", enum: STEP1_LEVELS },
               why: { type: "array", minItems: 1, maxItems: 3, items: { type: "string" } },
               do_today: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
               watch: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
@@ -162,24 +158,27 @@ OWNER NOTES
 ${notes}
 
 TASK
-Return 3–5 POSSIBLE issues (not diagnoses). Each issue should feel distinct and grounded in the notes.
+Return 3–5 DISTINCT POSSIBLE issues (not diagnoses). Keep it grounded in the notes.
 
 OUTPUT RULES
 - Issue title MUST contain "(possible)".
-- Add an urgency tag per issue:
-  LOW = likely home care/monitor
-  MEDIUM = monitor closely (24h) / consider vet if not improving
-  HIGH = stronger red-flags → consider vet sooner (still cautious wording)
+- Provide a "level" badge per issue (this is NOT an action, just concern level):
+  NHE = mild concern
+  TRUNGBINH = moderate
+  KHA_NANG = somewhat concerning
+  NANG = severe concern
+  KHAN_CAP = urgent concern (still cautious wording)
+- Avoid absolute language. Use "may/could/possible/consistent with".
 - Keep bullets short and practical.
 
 Also return:
 - title (one line)
 - intro (one line)
-- disclaimer (one paragraph, calm)
+- disclaimer (one calm paragraph)
     `.trim();
 
     const data = await openaiJson({
-      schemaName: "petpulse_step1_triage",
+      schemaName: "petpulse_step1_triage_v2",
       schema,
       system,
       user,
@@ -192,7 +191,7 @@ Also return:
 });
 
 /**
- * STEP 2
+ * STEP 2 (Round 1 confirm)
  * POST /confirm
  * body: { profile, symptoms, selected_issue_id, selected_issue_title, weather? }
  * returns: { selected_issue_title, questions:[...] }
@@ -209,8 +208,8 @@ app.post("/confirm", async (req, res) => {
 
     const system = `
 You are a calm veterinary assistant.
-Generate the minimum necessary follow-up questions to decide urgency.
-No diagnosis. No alarming language.
+Ask only the minimum necessary follow-up questions to reduce uncertainty.
+No diagnosis. Avoid certainty. Avoid alarming tone.
 Questions must be short and easy to answer.
     `.trim();
 
@@ -253,19 +252,23 @@ SELECTED POSSIBLE ISSUE
 ${issueTitle || issueId}
 
 TASK
-Ask 2–4 contextual follow-up questions to determine whether the owner should:
-- stay home care
-- monitor closely (24h)
-- seek vet care now
+Ask 2–4 contextual follow-up questions to determine urgency and what to do next.
+
+PRIORITY TOPICS (choose only what’s needed)
+- Timeline & frequency (when started, how often)
+- Hydration & ability to keep water down
+- Diarrhea / blood in vomit or stool
+- Possible toxin/foreign object exposure (chocolate, meds, plants, toy, bones, trash)
+- Ability to stand/walk normally, severe lethargy
 
 OUTPUT RULES
-- Questions must directly reduce uncertainty for urgency.
-- Avoid medical jargon.
 - Prefer yes/no or single-choice when possible.
+- Avoid medical jargon.
+- Avoid certainty in phrasing.
     `.trim();
 
     const data = await openaiJson({
-      schemaName: "petpulse_step2_questions",
+      schemaName: "petpulse_step2_questions_v2",
       schema,
       system,
       user,
@@ -278,31 +281,57 @@ OUTPUT RULES
 });
 
 /**
- * STEP 3
+ * STEP 3 (Decision engine)
  * POST /plan
- * body: { profile, symptoms, selected_issue_title, followup_answers, weather? }
- * returns: { urgency, headline, why, do_now, avoid, red_flags, disclaimer }
+ * body: {
+ *   profile, symptoms, selected_issue_title, followup_answers, weather?,
+ *   round?: 1|2,
+ *   previous_questions?: [...], // optional, for context
+ *   previous_answers?: {...}    // optional, for context
+ * }
+ *
+ * returns EITHER:
+ *   { result_type:"PLAN", urgency, headline, why, do_now, avoid, red_flags, disclaimer }
+ * OR
+ *   { result_type:"NEED_MORE_INFO", selected_issue_title, questions:[...], reason }
  */
 app.post("/plan", async (req, res) => {
   try {
-    const { profile, symptoms, selected_issue_title, followup_answers, weather } = req.body || {};
+    const {
+      profile,
+      symptoms,
+      selected_issue_title,
+      followup_answers,
+      weather,
+      round,
+      previous_questions,
+      previous_answers,
+    } = req.body || {};
+
     const notes = safeText(symptoms);
     const issueTitle = safeText(selected_issue_title);
+    const r = Number(round || 1);
 
     if (!notes) return res.status(400).json({ error: "Missing symptoms" });
     if (!issueTitle) return res.status(400).json({ error: "Missing selected_issue_title" });
+    if (![1, 2].includes(r)) return res.status(400).json({ error: "round must be 1 or 2" });
 
     const system = `
 You are a calm veterinary assistant.
 No diagnosis. No certainty. Decision support only.
 Be reassuring, practical, and clear.
+If information is insufficient, you may ask a few additional questions — but only if truly necessary.
     `.trim();
 
+    // ✅ Union schema with discriminator
     const schema = {
       type: "object",
       additionalProperties: false,
-      required: ["urgency", "headline", "why", "do_now", "avoid", "red_flags", "disclaimer"],
+      required: ["result_type"],
       properties: {
+        result_type: { type: "string", enum: ["PLAN", "NEED_MORE_INFO"] },
+
+        // PLAN payload
         urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
         headline: { type: "string" },
         why: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
@@ -310,7 +339,41 @@ Be reassuring, practical, and clear.
         avoid: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
         red_flags: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
         disclaimer: { type: "string" },
+
+        // NEED_MORE_INFO payload
+        selected_issue_title: { type: "string" },
+        reason: { type: "string" },
+        questions: {
+          type: "array",
+          minItems: 2,
+          maxItems: 3, // keep it tight
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id", "text", "type", "options"],
+            properties: {
+              id: { type: "string" },
+              text: { type: "string" },
+              type: { type: "string", enum: ["single_choice", "yes_no", "short_text"] },
+              options: { type: "array", minItems: 0, maxItems: 6, items: { type: "string" } },
+            },
+          },
+        },
       },
+      allOf: [
+        {
+          if: { properties: { result_type: { const: "PLAN" } } },
+          then: {
+            required: ["urgency", "headline", "why", "do_now", "avoid", "red_flags", "disclaimer"],
+          },
+        },
+        {
+          if: { properties: { result_type: { const: "NEED_MORE_INFO" } } },
+          then: {
+            required: ["selected_issue_title", "questions", "reason"],
+          },
+        },
+      ],
     };
 
     const user = `
@@ -326,28 +389,73 @@ ${notes}
 SELECTED POSSIBLE ISSUE
 ${issueTitle}
 
-FOLLOW-UP ANSWERS (owner responses)
+CONTEXT
+- This is follow-up round: ${r} (max 2 rounds total)
+- Previous questions (optional):
+${JSON.stringify(previous_questions || [], null, 2)}
+- Previous answers (optional):
+${JSON.stringify(previous_answers || {}, null, 2)}
+
+CURRENT FOLLOW-UP ANSWERS (owner responses)
 ${JSON.stringify(followup_answers || {}, null, 2)}
 
 TASK
-Return a clear action recommendation with one urgency bucket:
+You have two options:
+
+OPTION A — Return a clear action recommendation (result_type="PLAN") with ONE urgency bucket:
 - HOME (home care may be appropriate)
 - MONITOR_24H (monitor closely and reassess within 24 hours)
 - VET_NOW (seek veterinary care now)
 
-OUTPUT RULES
-- Be calm and non-alarming.
-- Give a practical plan the owner can follow today.
-- Include specific red flags that should trigger vet care.
-- End disclaimer as one paragraph.
+OPTION B — If and only if information is still insufficient to choose urgency safely,
+ask 2–3 more questions (result_type="NEED_MORE_INFO") to reduce uncertainty.
+Only use this option if truly necessary.
+
+STRICT RULES
+- No diagnosis. No certainty. Use cautious language.
+- If round=2, you MUST return PLAN (do NOT ask more questions).
+- Keep plan practical and calm.
+- Red flags should be specific but not alarming.
+- Avoid giving medication instructions. Avoid overly specific “home treatment recipes”.
     `.trim();
 
     const data = await openaiJson({
-      schemaName: "petpulse_step3_plan",
+      schemaName: "petpulse_step3_decision_v2",
       schema,
       system,
       user,
     });
+
+    // Enforce hard rule: round 2 must return PLAN
+    if (r === 2 && data?.result_type !== "PLAN") {
+      // fallback: force a safe PLAN if model violated (rare, but protect UX)
+      return res.status(200).json({
+        result_type: "PLAN",
+        urgency: "MONITOR_24H",
+        headline: "Monitor closely and consider contacting a vet if things don’t improve",
+        why: [
+          "Based on the information provided, this could still be a mild, self-limiting issue.",
+          "Because some details remain unclear, it’s safest to reassess within 24 hours or sooner if red flags appear.",
+        ],
+        do_now: [
+          "Offer small amounts of water frequently and observe whether your pet keeps it down.",
+          "Keep activity low and provide a quiet place to rest.",
+          "Track vomiting frequency, energy level, appetite, and stool changes.",
+        ],
+        avoid: [
+          "Avoid giving human medications unless a veterinarian specifically instructs you.",
+          "Avoid forcing food or water if your pet refuses or vomits after drinking.",
+        ],
+        red_flags: [
+          "Repeated vomiting or inability to keep water down",
+          "Blood in vomit or stool",
+          "Severe lethargy, collapse, or signs of significant pain",
+          "Bloated abdomen or repeated retching with little coming up",
+        ],
+        disclaimer:
+          "This is not a diagnosis. If you notice any red flags or your pet worsens at any time, contact a veterinarian promptly.",
+      });
+    }
 
     return res.status(200).json(data);
   } catch (e) {
