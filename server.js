@@ -92,68 +92,7 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
 }
 
 // ---------- constants ----------
-const STEP1_LEVELS = ["NHE", "TRUNGBINH", "KHA_NANG", "NANG", "KHAN_CAP"]; // Step 1 concern levels
-
-// ---------- small validators ----------
-function isNonEmptyString(x) {
-  return typeof x === "string" && x.trim().length > 0;
-}
-function isStringArray(x, min = 1) {
-  return Array.isArray(x) && x.filter((t) => typeof t === "string" && t.trim().length > 0).length >= min;
-}
-function hasPlanShape(obj) {
-  return (
-    obj &&
-    obj.result_type === "PLAN" &&
-    ["HOME", "MONITOR_24H", "VET_NOW"].includes(obj.urgency) &&
-    isNonEmptyString(obj.headline) &&
-    isStringArray(obj.why, 2) &&
-    isStringArray(obj.do_now, 3) &&
-    isStringArray(obj.avoid, 2) &&
-    isStringArray(obj.red_flags, 3) &&
-    isNonEmptyString(obj.disclaimer)
-  );
-}
-function hasNeedMoreInfoShape(obj) {
-  return (
-    obj &&
-    obj.result_type === "NEED_MORE_INFO" &&
-    isNonEmptyString(obj.selected_issue_title) &&
-    isNonEmptyString(obj.reason) &&
-    Array.isArray(obj.questions) &&
-    obj.questions.length >= 2 &&
-    obj.questions.length <= 3
-  );
-}
-
-function safeFallbackPlan() {
-  return {
-    result_type: "PLAN",
-    urgency: "MONITOR_24H",
-    headline: "Monitor closely and consider contacting a vet if things don’t improve",
-    why: [
-      "Based on the information provided, this could still be a mild, self-limiting issue.",
-      "Because some details remain unclear, it’s safest to reassess within 24 hours or sooner if red flags appear.",
-    ],
-    do_now: [
-      "Offer small amounts of water frequently and observe whether your pet keeps it down.",
-      "Keep activity low and provide a quiet place to rest.",
-      "Track symptom frequency, energy level, appetite, and stool changes.",
-    ],
-    avoid: [
-      "Avoid giving human medications unless a veterinarian specifically instructs you.",
-      "Avoid forcing food or water if your pet refuses or vomits after drinking.",
-    ],
-    red_flags: [
-      "Repeated vomiting or inability to keep water down",
-      "Blood in vomit or stool",
-      "Severe lethargy, collapse, or signs of significant pain",
-      "Bloated abdomen or repeated retching with little coming up",
-    ],
-    disclaimer:
-      "This is not a diagnosis. If you notice any red flags or your pet worsens at any time, contact a veterinarian promptly.",
-  };
-}
+const STEP1_LEVELS = ["NHE", "TRUNGBINH", "KHA_NANG", "NANG", "KHAN_CAP"]; // internal codes for Step 1 badge levels
 
 // ---------- routes ----------
 app.get("/health", (req, res) => res.status(200).send("ok"));
@@ -161,6 +100,8 @@ app.get("/health", (req, res) => res.status(200).send("ok"));
 /**
  * STEP 1
  * POST /tips
+ * body: { profile, symptoms, weather? }
+ * returns: { title, intro, issues:[...], disclaimer }
  */
 app.post("/tips", async (req, res) => {
   try {
@@ -249,7 +190,7 @@ Also return:
 });
 
 /**
- * STEP 2
+ * STEP 2 (Round 1 confirm)
  * POST /confirm
  */
 app.post("/confirm", async (req, res) => {
@@ -340,9 +281,10 @@ OUTPUT RULES
  * STEP 3 (Decision engine)
  * POST /plan
  *
- * FIXED: remove `allOf` (OpenAI schema rejects it)
- * We keep a "union-like" schema by making fields optional,
- * then validate server-side and fallback safely.
+ * IMPORTANT FIX:
+ * - OpenAI json_schema strict requires `required` to include EVERY key in `properties`.
+ * - So we cannot use allOf/if/then union schema.
+ * - We return a single "envelope" that always includes ALL fields.
  */
 app.post("/plan", async (req, res) => {
   try {
@@ -372,31 +314,35 @@ Be reassuring, practical, and clear.
 If information is insufficient, you may ask a few additional questions — but only if truly necessary.
     `.trim();
 
-    // ✅ IMPORTANT: No allOf/anyOf/oneOf. Keep schema flat.
-    // We enforce correctness via prompt + server-side validation.
+    // ✅ Single schema: ALL properties are REQUIRED (OpenAI strict requirement)
+    // We use result_type to tell the app which part to render.
     const schema = {
       type: "object",
       additionalProperties: false,
-      required: ["result_type"],
+      required: [
+        "result_type",
+        "selected_issue_title",
+        "reason",
+        "questions",
+        "urgency",
+        "headline",
+        "why",
+        "do_now",
+        "avoid",
+        "red_flags",
+        "disclaimer",
+      ],
       properties: {
         result_type: { type: "string", enum: ["PLAN", "NEED_MORE_INFO"] },
 
-        // PLAN payload (optional in schema; validated server-side)
-        urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
-        headline: { type: "string" },
-        why: { type: "array", minItems: 0, maxItems: 6, items: { type: "string" } },
-        do_now: { type: "array", minItems: 0, maxItems: 10, items: { type: "string" } },
-        avoid: { type: "array", minItems: 0, maxItems: 8, items: { type: "string" } },
-        red_flags: { type: "array", minItems: 0, maxItems: 12, items: { type: "string" } },
-        disclaimer: { type: "string" },
-
-        // NEED_MORE_INFO payload (optional in schema; validated server-side)
+        // always present (may be "" in PLAN)
         selected_issue_title: { type: "string" },
         reason: { type: "string" },
+
         questions: {
           type: "array",
           minItems: 0,
-          maxItems: 3,
+          maxItems: 4,
           items: {
             type: "object",
             additionalProperties: false,
@@ -409,6 +355,15 @@ If information is insufficient, you may ask a few additional questions — but o
             },
           },
         },
+
+        // always present (even if result_type=NEED_MORE_INFO, provide safe placeholders)
+        urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
+        headline: { type: "string" },
+        why: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
+        do_now: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
+        avoid: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
+        red_flags: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
+        disclaimer: { type: "string" },
       },
     };
 
@@ -436,27 +391,30 @@ CURRENT FOLLOW-UP ANSWERS (owner responses)
 ${JSON.stringify(followup_answers || {}, null, 2)}
 
 TASK
-You have two options:
+Return ONE JSON object that ALWAYS includes ALL fields listed in the schema.
 
-OPTION A — Return a clear action recommendation with:
-result_type="PLAN"
-and ONE urgency bucket: HOME / MONITOR_24H / VET_NOW
+If you can decide safely:
+- Set result_type="PLAN"
+- selected_issue_title="${issueTitle}"
+- reason="" (empty string)
+- questions=[] (empty array)
+- Fill the PLAN fields with a clear action recommendation using ONE urgency bucket:
+  HOME / MONITOR_24H / VET_NOW
 
-OPTION B — If and only if information is still insufficient to choose urgency safely,
-ask 2–3 more questions with:
-result_type="NEED_MORE_INFO"
-Include: selected_issue_title, reason, questions (2–3 items)
+If information is still insufficient AND round=1:
+- Set result_type="NEED_MORE_INFO"
+- selected_issue_title="${issueTitle}"
+- reason: short explanation (1–2 sentences)
+- questions: ask 2–3 more questions only (keep tight)
+- STILL fill the PLAN fields with SAFE placeholders:
+  urgency="MONITOR_24H"
+  headline: "A bit more info will help narrow the safest next step"
+  why/do_now/avoid/red_flags/disclaimer: provide calm, generic safety guidance
 
 STRICT RULES
 - No diagnosis. No certainty. Use cautious language.
-- If round=2, you MUST return PLAN (do NOT ask more questions).
-- Keep plan practical and calm.
-- Red flags should be specific but not alarming.
-- Avoid giving medication instructions. Avoid overly specific “home treatment recipes”.
-
-OUTPUT REQUIREMENTS
-- If result_type="PLAN": include urgency, headline, why(2–4), do_now(3–6), avoid(2–4), red_flags(3–6), disclaimer.
-- If result_type="NEED_MORE_INFO": include selected_issue_title, reason, questions(2–3).
+- If round=2, you MUST return result_type="PLAN" and questions=[].
+- Avoid medication instructions and overly specific home-treatment recipes.
     `.trim();
 
     const data = await openaiJson({
@@ -466,24 +424,40 @@ OUTPUT REQUIREMENTS
       user,
     });
 
-    // ✅ Hard rule: round 2 must return PLAN
-    if (r === 2) {
-      if (!data || data.result_type !== "PLAN" || !hasPlanShape(data)) {
-        return res.status(200).json(safeFallbackPlan());
-      }
-      return res.status(200).json(data);
+    // Enforce hard rule: round 2 must return PLAN
+    if (r === 2 && data?.result_type !== "PLAN") {
+      return res.status(200).json({
+        result_type: "PLAN",
+        selected_issue_title: issueTitle,
+        reason: "",
+        questions: [],
+        urgency: "MONITOR_24H",
+        headline: "Monitor closely and consider contacting a vet if things don’t improve",
+        why: [
+          "Based on the information provided, this may still be a mild, self-limiting issue.",
+          "Because some details remain unclear, it’s safest to reassess within 24 hours or sooner if red flags appear.",
+        ],
+        do_now: [
+          "Offer small amounts of water frequently and observe whether your pet keeps it down.",
+          "Keep activity low and provide a quiet place to rest.",
+          "Track symptom frequency, energy level, appetite, and stool changes.",
+        ],
+        avoid: [
+          "Avoid giving human medications unless a veterinarian specifically instructs you.",
+          "Avoid forcing food or water if your pet refuses or vomits after drinking.",
+        ],
+        red_flags: [
+          "Repeated vomiting or inability to keep water down",
+          "Blood in vomit or stool",
+          "Severe lethargy, collapse, or signs of significant pain",
+          "Labored breathing or repeated retching with little coming up",
+        ],
+        disclaimer:
+          "This is not a diagnosis. If you notice any red flags or your pet worsens at any time, contact a veterinarian promptly.",
+      });
     }
 
-    // ✅ Round 1: accept either, but validate
-    if (hasPlanShape(data)) {
-      return res.status(200).json(data);
-    }
-    if (hasNeedMoreInfoShape(data)) {
-      return res.status(200).json(data);
-    }
-
-    // If model returned something malformed, protect UX
-    return res.status(200).json(safeFallbackPlan());
+    return res.status(200).json(data);
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   }
