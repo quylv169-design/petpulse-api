@@ -34,6 +34,11 @@ function profileBlock(p = {}) {
   ].join("\n");
 }
 
+/**
+ * OpenAI Responses API helper
+ * NOTE: OpenAI changed `response_format` -> `text.format`
+ * We now pass the json_schema under `text.format`.
+ */
 async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-mini" }) {
   mustEnv();
 
@@ -43,10 +48,10 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    // Force structured JSON output (most stable for app parsing)
-    response_format: {
-      type: "json_schema",
-      json_schema: {
+    // ✅ NEW: structured output lives under text.format (NOT response_format)
+    text: {
+      format: {
+        type: "json_schema",
         name: schemaName,
         schema,
         strict: true,
@@ -76,11 +81,11 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
     throw new Error(`Could not parse OpenAI response JSON envelope: ${e}`);
   }
 
-  // Responses API returns output array; extract the JSON string content
-  // When using json_schema, the model output is returned as a "message" with JSON string
+  // Responses API: prefer output_text; fallback to first message content text
   const outputText =
+    json?.output_text ||
     json?.output?.[0]?.content?.[0]?.text ||
-    json?.output_text; // fallback
+    "";
 
   if (!outputText || typeof outputText !== "string") {
     throw new Error("OpenAI returned empty structured output.");
@@ -89,7 +94,9 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
   try {
     return JSON.parse(outputText);
   } catch (e) {
-    throw new Error(`Could not parse structured JSON result: ${e}. Raw: ${outputText.slice(0, 400)}`);
+    throw new Error(
+      `Could not parse structured JSON result: ${e}. Raw: ${outputText.slice(0, 400)}`
+    );
   }
 }
 
