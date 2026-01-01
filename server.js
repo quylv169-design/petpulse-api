@@ -136,9 +136,7 @@ Never use alarming tone unless describing clear red flags, and still stay calm.
             properties: {
               id: { type: "string" },
               title: { type: "string" }, // must include "(possible)"
-              // ✅ NEW: rank 1..5 (1 = most likely based on the notes)
               rank: { type: "integer", minimum: 1, maximum: 5 },
-              // ✅ 5-level badge for Step 1 (concern level, not action)
               level: { type: "string", enum: STEP1_LEVELS },
               why: { type: "array", minItems: 1, maxItems: 3, items: { type: "string" } },
               do_today: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
@@ -191,10 +189,8 @@ Also return:
       user,
     });
 
-    // ✅ Safety: enforce sorting by rank server-side (in case model order differs)
     if (data?.issues && Array.isArray(data.issues)) {
       data.issues.sort((a, b) => (Number(a.rank) || 999) - (Number(b.rank) || 999));
-      // ✅ normalize ranks to 1..N just in case
       data.issues = data.issues.map((it, idx) => ({ ...it, rank: idx + 1 }));
     }
 
@@ -327,6 +323,8 @@ Be reassuring, practical, and clear.
 If information is insufficient, you may ask a few additional questions — but only if truly necessary.
     `.trim();
 
+    // ✅ IMPORTANT: OpenAI structured schema does NOT allow allOf/if/then.
+    // We keep the schema flat and validate required fields server-side by result_type.
     const schema = {
       type: "object",
       additionalProperties: false,
@@ -334,6 +332,7 @@ If information is insufficient, you may ask a few additional questions — but o
       properties: {
         result_type: { type: "string", enum: ["PLAN", "NEED_MORE_INFO"] },
 
+        // PLAN fields (validated server-side when result_type="PLAN")
         urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
         headline: { type: "string" },
         why: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
@@ -342,6 +341,7 @@ If information is insufficient, you may ask a few additional questions — but o
         red_flags: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
         disclaimer: { type: "string" },
 
+        // NEED_MORE_INFO fields (validated server-side when result_type="NEED_MORE_INFO")
         selected_issue_title: { type: "string" },
         reason: { type: "string" },
         questions: {
@@ -361,20 +361,6 @@ If information is insufficient, you may ask a few additional questions — but o
           },
         },
       },
-      allOf: [
-        {
-          if: { properties: { result_type: { const: "PLAN" } } },
-          then: {
-            required: ["urgency", "headline", "why", "do_now", "avoid", "red_flags", "disclaimer"],
-          },
-        },
-        {
-          if: { properties: { result_type: { const: "NEED_MORE_INFO" } } },
-          then: {
-            required: ["selected_issue_title", "questions", "reason"],
-          },
-        },
-      ],
     };
 
     const user = `
@@ -418,6 +404,9 @@ STRICT RULES
 - Keep plan practical and calm.
 - Red flags should be specific but not alarming.
 - Avoid giving medication instructions. Avoid overly specific home treatment recipes.
+
+OUTPUT RULES
+- Return ONLY valid JSON matching the schema.
     `.trim();
 
     const data = await openaiJson({
@@ -427,6 +416,13 @@ STRICT RULES
       user,
     });
 
+    // ✅ Server-side validation by result_type (since we removed allOf/if/then)
+    const hasAll = (obj, keys) => keys.every((k) => obj?.[k] !== undefined && obj?.[k] !== null);
+
+    const planRequired = ["urgency", "headline", "why", "do_now", "avoid", "red_flags", "disclaimer"];
+    const needMoreRequired = ["selected_issue_title", "questions", "reason"];
+
+    // round=2 hard rule: must be PLAN (your original safety net stays)
     if (r === 2 && data?.result_type !== "PLAN") {
       return res.status(200).json({
         result_type: "PLAN",
@@ -444,6 +440,65 @@ STRICT RULES
         avoid: [
           "Avoid giving human medications unless a veterinarian specifically instructs you.",
           "Avoid forcing food or water if your pet refuses or vomits after drinking.",
+        ],
+        red_flags: [
+          "Repeated vomiting or inability to keep water down",
+          "Blood in vomit or stool",
+          "Severe lethargy, collapse, or signs of significant pain",
+          "Bloated abdomen or repeated retching with little coming up",
+        ],
+        disclaimer:
+          "This is not a diagnosis. If you notice any red flags or your pet worsens at any time, contact a veterinarian promptly.",
+      });
+    }
+
+    // If model says PLAN but misses required fields → fallback safe PLAN
+    if (data?.result_type === "PLAN" && !hasAll(data, planRequired)) {
+      return res.status(200).json({
+        result_type: "PLAN",
+        urgency: data?.urgency || "MONITOR_24H",
+        headline: data?.headline || "Here’s a calm, practical next-step plan",
+        why: Array.isArray(data?.why) && data.why.length ? data.why : [
+          "Based on the information provided, this may be consistent with a mild issue.",
+          "It’s safest to monitor closely and reassess if anything worsens.",
+        ],
+        do_now: Array.isArray(data?.do_now) && data.do_now.length ? data.do_now : [
+          "Offer small amounts of water frequently and observe whether your pet keeps it down.",
+          "Keep activity low and provide a quiet place to rest.",
+          "Track key changes: energy, appetite, vomiting/diarrhea, and hydration.",
+        ],
+        avoid: Array.isArray(data?.avoid) && data.avoid.length ? data.avoid : [
+          "Avoid giving human medications unless a veterinarian instructs you.",
+          "Avoid forcing food or water if vomiting continues.",
+        ],
+        red_flags: Array.isArray(data?.red_flags) && data.red_flags.length ? data.red_flags : [
+          "Repeated vomiting or inability to keep water down",
+          "Blood in vomit or stool",
+          "Severe lethargy, collapse, or signs of significant pain",
+        ],
+        disclaimer: data?.disclaimer ||
+          "This is not a diagnosis. If you notice red flags or your pet worsens at any time, contact a veterinarian promptly.",
+      });
+    }
+
+    // If model says NEED_MORE_INFO but misses fields → fallback safe PLAN (don’t block UX)
+    if (data?.result_type === "NEED_MORE_INFO" && !hasAll(data, needMoreRequired)) {
+      return res.status(200).json({
+        result_type: "PLAN",
+        urgency: "MONITOR_24H",
+        headline: "Monitor closely and consider contacting a vet if things don’t improve",
+        why: [
+          "Some details are unclear, and it’s safer not to delay a basic monitoring plan.",
+          "If any red flags appear, getting veterinary help sooner is the safest choice.",
+        ],
+        do_now: [
+          "Offer small amounts of water frequently and observe whether your pet keeps it down.",
+          "Keep activity low and provide a quiet place to rest.",
+          "Track symptoms and reassess within 24 hours or sooner if worsening.",
+        ],
+        avoid: [
+          "Avoid giving human medications unless a veterinarian instructs you.",
+          "Avoid forcing food or water if vomiting continues.",
         ],
         red_flags: [
           "Repeated vomiting or inability to keep water down",
