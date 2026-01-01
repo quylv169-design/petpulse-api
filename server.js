@@ -35,7 +35,7 @@ function profileBlock(p = {}) {
 }
 
 /**
- * OpenAI Responses API helper
+ * OpenAI Responses API helper (JSON Schema)
  * NOTE: OpenAI changed `response_format` -> `text.format`
  */
 async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-mini" }) {
@@ -88,6 +88,59 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
     return JSON.parse(outputText);
   } catch (e) {
     throw new Error(`Could not parse structured JSON result: ${e}. Raw: ${outputText.slice(0, 600)}`);
+  }
+}
+
+/**
+ * OpenAI Responses API helper (JSON Object)
+ * Use this for Step 3 because strict json_schema now enforces
+ * "required must include every key in properties", which breaks conditional schemas.
+ */
+async function openaiJsonObject({ system, user, model = "gpt-4.1-mini" }) {
+  mustEnv();
+
+  const body = {
+    model,
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    text: {
+      format: { type: "json_object" },
+    },
+  };
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`OpenAI error ${res.status}: ${text.slice(0, 800)}`);
+  }
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Could not parse OpenAI response JSON envelope: ${e}`);
+  }
+
+  const outputText = json?.output_text || json?.output?.[0]?.content?.[0]?.text || "";
+  if (!outputText || typeof outputText !== "string") {
+    throw new Error("OpenAI returned empty JSON output.");
+  }
+
+  try {
+    return JSON.parse(outputText);
+  } catch (e) {
+    throw new Error(`Could not parse JSON result: ${e}. Raw: ${outputText.slice(0, 600)}`);
   }
 }
 
@@ -323,46 +376,6 @@ Be reassuring, practical, and clear.
 If information is insufficient, you may ask a few additional questions — but only if truly necessary.
     `.trim();
 
-    // ✅ IMPORTANT: OpenAI structured schema does NOT allow allOf/if/then.
-    // We keep the schema flat and validate required fields server-side by result_type.
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      required: ["result_type"],
-      properties: {
-        result_type: { type: "string", enum: ["PLAN", "NEED_MORE_INFO"] },
-
-        // PLAN fields (validated server-side when result_type="PLAN")
-        urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
-        headline: { type: "string" },
-        why: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
-        do_now: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
-        avoid: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
-        red_flags: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
-        disclaimer: { type: "string" },
-
-        // NEED_MORE_INFO fields (validated server-side when result_type="NEED_MORE_INFO")
-        selected_issue_title: { type: "string" },
-        reason: { type: "string" },
-        questions: {
-          type: "array",
-          minItems: 2,
-          maxItems: 3,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: ["id", "text", "type", "options"],
-            properties: {
-              id: { type: "string" },
-              text: { type: "string" },
-              type: { type: "string", enum: ["single_choice", "yes_no", "short_text"] },
-              options: { type: "array", minItems: 0, maxItems: 6, items: { type: "string" } },
-            },
-          },
-        },
-      },
-    };
-
     const user = `
 PET PROFILE
 ${profileBlock(profile)}
@@ -405,18 +418,22 @@ STRICT RULES
 - Red flags should be specific but not alarming.
 - Avoid giving medication instructions. Avoid overly specific home treatment recipes.
 
-OUTPUT RULES
-- Return ONLY valid JSON matching the schema.
+OUTPUT FORMAT (VERY IMPORTANT)
+- Return ONLY valid JSON (no markdown, no extra text).
+- If result_type="PLAN", include keys:
+  result_type, urgency, headline, why, do_now, avoid, red_flags, disclaimer
+- If result_type="NEED_MORE_INFO", include keys:
+  result_type, selected_issue_title, reason, questions
+- questions items must include: id, text, type, options
     `.trim();
 
-    const data = await openaiJson({
-      schemaName: "petpulse_step3_decision_v2",
-      schema,
+    // ✅ Use json_object for Step 3 to avoid strict json_schema enforcement changes
+    const data = await openaiJsonObject({
       system,
       user,
     });
 
-    // ✅ Server-side validation by result_type (since we removed allOf/if/then)
+    // ✅ Server-side validation by result_type (since Step 3 is json_object)
     const hasAll = (obj, keys) => keys.every((k) => obj?.[k] !== undefined && obj?.[k] !== null);
 
     const planRequired = ["urgency", "headline", "why", "do_now", "avoid", "red_flags", "disclaimer"];
