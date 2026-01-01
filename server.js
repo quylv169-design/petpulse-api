@@ -22,15 +22,67 @@ function safeText(v) {
   return v.trim();
 }
 
+function toInt(v, fallback = null) {
+  if (v === undefined || v === null) return fallback;
+  if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+  const n = parseInt(String(v).trim(), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n, min, max) {
+  if (!Number.isFinite(n)) return n;
+  return Math.max(min, Math.min(max, n));
+}
+
+// Normalize profile to support multiple client payload shapes
+function normalizeProfile(p = {}) {
+  // Preferred: ageYears + ageMonths
+  // Accept snake_case: age_years + age_months
+  // Backward-compatible: age (years only)
+  const ageYears = p.ageYears ?? p.age_years ?? p.age ?? null;
+  const ageMonths = p.ageMonths ?? p.age_months ?? null;
+
+  return {
+    petName: safeText(p.petName),
+    species: safeText(p.species),
+    breed: safeText(p.breed),
+    petGender: safeText(p.petGender),
+    ageYears: clamp(toInt(ageYears, null), 0, 50),
+    ageMonths: clamp(toInt(ageMonths, null), 0, 11),
+    weightLb: p.weightLb ?? p.weight_lb ?? "Unknown",
+    city: safeText(p.city),
+    country: safeText(p.country),
+  };
+}
+
+function formatPetAge(yearsRaw, monthsRaw) {
+  const years = yearsRaw === null ? null : clamp(toInt(yearsRaw, 0), 0, 50);
+  const months = monthsRaw === null ? null : clamp(toInt(monthsRaw, 0), 0, 11);
+
+  // If both missing -> Unknown
+  if (years === null && months === null) return "Unknown";
+
+  const y = years ?? 0;
+  const m = months ?? 0;
+
+  // Prefer month-only display if < 1 year
+  if (y === 0 && m > 0) return `${m} month${m === 1 ? "" : "s"}`;
+  if (y > 0 && m === 0) return `${y} year${y === 1 ? "" : "s"}`;
+  if (y === 0 && m === 0) return "0 months";
+  return `${y} year${y === 1 ? "" : "s"} ${m} month${m === 1 ? "" : "s"}`;
+}
+
 function profileBlock(p = {}) {
+  const prof = normalizeProfile(p);
+
   return [
-    `Pet name: ${safeText(p.petName) || "Unknown"}`,
-    `Species: ${safeText(p.species) || "Unknown"}`,
-    `Breed: ${safeText(p.breed) || "Unknown"}`,
-    `Sex: ${safeText(p.petGender) || "Unknown"}`,
-    `Age: ${p.age ?? "Unknown"}`,
-    `Weight (lb): ${p.weightLb ?? "Unknown"}`,
-    `Location: ${safeText(p.city) || "Unknown"}, ${safeText(p.country) || "Unknown"}`,
+    `Pet name: ${prof.petName || "Unknown"}`,
+    `Species: ${prof.species || "Unknown"}`,
+    `Breed: ${prof.breed || "Unknown"}`,
+    `Sex: ${prof.petGender || "Unknown"}`,
+    `Age: ${formatPetAge(prof.ageYears, prof.ageMonths)}`,
+    `Weight (lb): ${prof.weightLb ?? "Unknown"}`,
+    `Location: ${prof.city || "Unknown"}, ${prof.country || "Unknown"}`,
   ].join("\n");
 }
 
