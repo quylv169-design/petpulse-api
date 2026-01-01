@@ -92,7 +92,7 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
 }
 
 // ---------- constants ----------
-const STEP1_LEVELS = ["NHE", "TRUNGBINH", "KHA_NANG", "NANG", "KHAN_CAP"]; // internal codes for Step 1 badge levels
+const STEP1_LEVELS = ["NHE", "TRUNGBINH", "KHA_NANG", "NANG", "KHAN_CAP"]; // for badges in Step 1
 
 // ---------- routes ----------
 app.get("/health", (req, res) => res.status(200).send("ok"));
@@ -132,10 +132,13 @@ Never use alarming tone unless describing clear red flags, and still stay calm.
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["id", "title", "level", "why", "do_today", "watch"],
+            required: ["id", "title", "rank", "level", "why", "do_today", "watch"],
             properties: {
               id: { type: "string" },
               title: { type: "string" }, // must include "(possible)"
+              // ✅ NEW: rank 1..5 (1 = most likely based on the notes)
+              rank: { type: "integer", minimum: 1, maximum: 5 },
+              // ✅ 5-level badge for Step 1 (concern level, not action)
               level: { type: "string", enum: STEP1_LEVELS },
               why: { type: "array", minItems: 1, maxItems: 3, items: { type: "string" } },
               do_today: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
@@ -159,6 +162,11 @@ ${notes}
 TASK
 Return 3–5 DISTINCT POSSIBLE issues (not diagnoses). Keep it grounded in the notes.
 
+ORDERING + RANKING
+- Sort issues from MOST LIKELY to LEAST LIKELY based on the notes.
+- Assign rank=1 to the most likely issue, then 2, 3... up to N (N <= 5).
+- rank must be unique and sequential (no gaps).
+
 OUTPUT RULES
 - Issue title MUST contain "(possible)".
 - Provide a "level" badge per issue (this is NOT an action, just concern level):
@@ -177,11 +185,18 @@ Also return:
     `.trim();
 
     const data = await openaiJson({
-      schemaName: "petpulse_step1_triage_v2",
+      schemaName: "petpulse_step1_triage_v3_ranked",
       schema,
       system,
       user,
     });
+
+    // ✅ Safety: enforce sorting by rank server-side (in case model order differs)
+    if (data?.issues && Array.isArray(data.issues)) {
+      data.issues.sort((a, b) => (Number(a.rank) || 999) - (Number(b.rank) || 999));
+      // ✅ normalize ranks to 1..N just in case
+      data.issues = data.issues.map((it, idx) => ({ ...it, rank: idx + 1 }));
+    }
 
     return res.status(200).json(data);
   } catch (e) {
@@ -192,6 +207,8 @@ Also return:
 /**
  * STEP 2 (Round 1 confirm)
  * POST /confirm
+ * body: { profile, symptoms, selected_issue_id, selected_issue_title, weather? }
+ * returns: { selected_issue_title, questions:[...] }
  */
 app.post("/confirm", async (req, res) => {
   try {
@@ -280,11 +297,7 @@ OUTPUT RULES
 /**
  * STEP 3 (Decision engine)
  * POST /plan
- *
- * IMPORTANT FIX:
- * - OpenAI json_schema strict requires `required` to include EVERY key in `properties`.
- * - So we cannot use allOf/if/then union schema.
- * - We return a single "envelope" that always includes ALL fields.
+ * returns either PLAN or NEED_MORE_INFO (max 2 rounds total)
  */
 app.post("/plan", async (req, res) => {
   try {
@@ -314,35 +327,27 @@ Be reassuring, practical, and clear.
 If information is insufficient, you may ask a few additional questions — but only if truly necessary.
     `.trim();
 
-    // ✅ Single schema: ALL properties are REQUIRED (OpenAI strict requirement)
-    // We use result_type to tell the app which part to render.
     const schema = {
       type: "object",
       additionalProperties: false,
-      required: [
-        "result_type",
-        "selected_issue_title",
-        "reason",
-        "questions",
-        "urgency",
-        "headline",
-        "why",
-        "do_now",
-        "avoid",
-        "red_flags",
-        "disclaimer",
-      ],
+      required: ["result_type"],
       properties: {
         result_type: { type: "string", enum: ["PLAN", "NEED_MORE_INFO"] },
 
-        // always present (may be "" in PLAN)
+        urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
+        headline: { type: "string" },
+        why: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
+        do_now: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
+        avoid: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
+        red_flags: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
+        disclaimer: { type: "string" },
+
         selected_issue_title: { type: "string" },
         reason: { type: "string" },
-
         questions: {
           type: "array",
-          minItems: 0,
-          maxItems: 4,
+          minItems: 2,
+          maxItems: 3,
           items: {
             type: "object",
             additionalProperties: false,
@@ -355,16 +360,21 @@ If information is insufficient, you may ask a few additional questions — but o
             },
           },
         },
-
-        // always present (even if result_type=NEED_MORE_INFO, provide safe placeholders)
-        urgency: { type: "string", enum: ["HOME", "MONITOR_24H", "VET_NOW"] },
-        headline: { type: "string" },
-        why: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
-        do_now: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
-        avoid: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
-        red_flags: { type: "array", minItems: 3, maxItems: 6, items: { type: "string" } },
-        disclaimer: { type: "string" },
       },
+      allOf: [
+        {
+          if: { properties: { result_type: { const: "PLAN" } } },
+          then: {
+            required: ["urgency", "headline", "why", "do_now", "avoid", "red_flags", "disclaimer"],
+          },
+        },
+        {
+          if: { properties: { result_type: { const: "NEED_MORE_INFO" } } },
+          then: {
+            required: ["selected_issue_title", "questions", "reason"],
+          },
+        },
+      ],
     };
 
     const user = `
@@ -391,30 +401,23 @@ CURRENT FOLLOW-UP ANSWERS (owner responses)
 ${JSON.stringify(followup_answers || {}, null, 2)}
 
 TASK
-Return ONE JSON object that ALWAYS includes ALL fields listed in the schema.
+You have two options:
 
-If you can decide safely:
-- Set result_type="PLAN"
-- selected_issue_title="${issueTitle}"
-- reason="" (empty string)
-- questions=[] (empty array)
-- Fill the PLAN fields with a clear action recommendation using ONE urgency bucket:
-  HOME / MONITOR_24H / VET_NOW
+OPTION A — Return a clear action recommendation (result_type="PLAN") with ONE urgency bucket:
+- HOME
+- MONITOR_24H
+- VET_NOW
 
-If information is still insufficient AND round=1:
-- Set result_type="NEED_MORE_INFO"
-- selected_issue_title="${issueTitle}"
-- reason: short explanation (1–2 sentences)
-- questions: ask 2–3 more questions only (keep tight)
-- STILL fill the PLAN fields with SAFE placeholders:
-  urgency="MONITOR_24H"
-  headline: "A bit more info will help narrow the safest next step"
-  why/do_now/avoid/red_flags/disclaimer: provide calm, generic safety guidance
+OPTION B — If and only if information is still insufficient to choose urgency safely,
+ask 2–3 more questions (result_type="NEED_MORE_INFO") to reduce uncertainty.
+Only use this option if truly necessary.
 
 STRICT RULES
 - No diagnosis. No certainty. Use cautious language.
-- If round=2, you MUST return result_type="PLAN" and questions=[].
-- Avoid medication instructions and overly specific home-treatment recipes.
+- If round=2, you MUST return PLAN (do NOT ask more questions).
+- Keep plan practical and calm.
+- Red flags should be specific but not alarming.
+- Avoid giving medication instructions. Avoid overly specific home treatment recipes.
     `.trim();
 
     const data = await openaiJson({
@@ -424,23 +427,19 @@ STRICT RULES
       user,
     });
 
-    // Enforce hard rule: round 2 must return PLAN
     if (r === 2 && data?.result_type !== "PLAN") {
       return res.status(200).json({
         result_type: "PLAN",
-        selected_issue_title: issueTitle,
-        reason: "",
-        questions: [],
         urgency: "MONITOR_24H",
         headline: "Monitor closely and consider contacting a vet if things don’t improve",
         why: [
-          "Based on the information provided, this may still be a mild, self-limiting issue.",
+          "Based on the information provided, this could still be a mild, self-limiting issue.",
           "Because some details remain unclear, it’s safest to reassess within 24 hours or sooner if red flags appear.",
         ],
         do_now: [
           "Offer small amounts of water frequently and observe whether your pet keeps it down.",
           "Keep activity low and provide a quiet place to rest.",
-          "Track symptom frequency, energy level, appetite, and stool changes.",
+          "Track vomiting frequency, energy level, appetite, and stool changes.",
         ],
         avoid: [
           "Avoid giving human medications unless a veterinarian specifically instructs you.",
@@ -450,7 +449,7 @@ STRICT RULES
           "Repeated vomiting or inability to keep water down",
           "Blood in vomit or stool",
           "Severe lethargy, collapse, or signs of significant pain",
-          "Labored breathing or repeated retching with little coming up",
+          "Bloated abdomen or repeated retching with little coming up",
         ],
         disclaimer:
           "This is not a diagnosis. If you notice any red flags or your pet worsens at any time, contact a veterinarian promptly.",
