@@ -250,10 +250,22 @@ ${safeText(selected_issue_title)}
 
 /**
  * STEP 3 — /plan
- * Enforce max 2 rounds:
- * - round 1: PLAN or NEED_MORE_INFO
- * - round 2: MUST return PLAN
+ * FIXED: enforce 2 rounds + sanitize questions
  */
+function sanitizeQuestions(raw = []) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((q, i) => ({
+    id: safeText(q?.id) || `q_${i + 1}`,
+    text: safeText(q?.text) || "Please share a bit more detail.",
+    type: ["yes_no", "single_choice", "short_text"].includes(q?.type)
+      ? q.type
+      : "short_text",
+    options: Array.isArray(q?.options)
+      ? q.options.map(o => safeText(o)).filter(Boolean)
+      : [],
+  }));
+}
+
 app.post("/plan", async (req, res) => {
   try {
     const {
@@ -270,18 +282,15 @@ app.post("/plan", async (req, res) => {
     const issueTitle = safeText(selected_issue_title);
     const r = Number(round || 1);
 
-    if (!notes || !issueTitle) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    if (![1, 2].includes(r)) {
-      return res.status(400).json({ error: "round must be 1 or 2" });
-    }
+    if (!notes) return res.status(400).json({ error: "Missing symptoms" });
+    if (!issueTitle) return res.status(400).json({ error: "Missing selected_issue_title" });
+    if (![1, 2].includes(r)) return res.status(400).json({ error: "round must be 1 or 2" });
 
     const system = `
 You are a calm veterinary assistant.
 No diagnosis. No certainty.
 Decision support only.
+If round=2 you MUST return PLAN.
 `.trim();
 
     const user = `
@@ -307,52 +316,34 @@ ${JSON.stringify(previous_answers || {}, null, 2)}
 
 CURRENT ANSWERS
 ${JSON.stringify(followup_answers || {}, null, 2)}
-
-TASK
-You have two options:
-
-OPTION A — Return a clear action recommendation (result_type="PLAN") with urgency:
-HOME | MONITOR_24H | VET_NOW
-
-OPTION B — If and only if this is round 1 AND information is insufficient,
-ask 2–3 more questions (result_type="NEED_MORE_INFO").
-
-STRICT RULES
-- If round = 2, you MUST return PLAN.
-- No diagnosis. Use cautious language.
-- Return ONLY valid JSON.
 `.trim();
 
     const data = await openaiJsonObject({ system, user });
 
-    // ---------- ENFORCEMENT ----------
-    if (r === 2 && data?.result_type !== "PLAN") {
-      return res.json({
-        result_type: "PLAN",
-        urgency: "MONITOR_24H",
-        headline: "Monitor closely and consider contacting a vet if symptoms persist",
-        why: [
-          "Some details remain unclear, but there are no immediate red flags.",
-          "Monitoring closely over the next 24 hours is a cautious next step.",
-        ],
-        do_now: [
-          "Ensure your pet has access to fresh water and a quiet place to rest.",
-          "Monitor appetite, energy level, and any vomiting or diarrhea.",
-        ],
-        avoid: [
-          "Avoid giving human medications unless directed by a veterinarian.",
-        ],
-        red_flags: [
-          "Repeated vomiting or inability to keep water down",
-          "Blood in vomit or stool",
-          "Severe lethargy or collapse",
-        ],
-        disclaimer:
-          "This is not a diagnosis. If your pet worsens or you notice red flags, contact a veterinarian promptly.",
-      });
+    if (data?.result_type === "NEED_MORE_INFO") {
+      const cleanQs = sanitizeQuestions(data.questions);
+      if (r === 1 && cleanQs.length > 0) {
+        return res.json({
+          result_type: "NEED_MORE_INFO",
+          selected_issue_title: issueTitle,
+          reason: safeText(data.reason) || "A bit more detail will help.",
+          questions: cleanQs,
+        });
+      }
     }
 
-    return res.json(data);
+    return res.json({
+      result_type: "PLAN",
+      urgency: data?.urgency || "MONITOR_24H",
+      headline: data?.headline || "Monitor closely and consider contacting a vet if needed",
+      why: Array.isArray(data?.why) ? data.why : [],
+      do_now: Array.isArray(data?.do_now) ? data.do_now : [],
+      avoid: Array.isArray(data?.avoid) ? data.avoid : [],
+      red_flags: Array.isArray(data?.red_flags) ? data.red_flags : [],
+      disclaimer:
+        data?.disclaimer ||
+        "This is not a diagnosis. If symptoms worsen or red flags appear, contact a veterinarian.",
+    });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
