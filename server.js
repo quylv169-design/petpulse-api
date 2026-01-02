@@ -159,6 +159,8 @@ app.post("/tips", async (req, res) => {
         disclaimer: { type: "string" },
         issues: {
           type: "array",
+          minItems: 3,
+          maxItems: 5,
           items: {
             type: "object",
             additionalProperties: false,
@@ -166,7 +168,7 @@ app.post("/tips", async (req, res) => {
             properties: {
               id: { type: "string" },
               title: { type: "string" },
-              rank: { type: "integer" },
+              rank: { type: "integer", minimum: 1, maximum: 5 },
               level: { type: "string", enum: STEP1_LEVELS },
               why: { type: "array", items: { type: "string" } },
               do_today: { type: "array", items: { type: "string" } },
@@ -188,8 +190,24 @@ ${contextualWeatherBlock(profile)}
 
 OWNER NOTES
 ${safeText(symptoms)}
-`,
+
+TASK
+Return 3–5 DISTINCT POSSIBLE issues (not diagnoses), grounded in the notes.
+
+HARD REQUIREMENTS
+- You MUST return between 3 and 5 issues (min 3, max 5).
+- Sort issues from MOST LIKELY to LEAST LIKELY.
+- Assign unique sequential rank starting at 1 (no gaps).
+`.trim(),
     });
+
+    // Defensive enforcement: sort + normalize rank, keep max 5
+    if (data?.issues && Array.isArray(data.issues)) {
+      data.issues = data.issues
+        .slice(0, 5)
+        .sort((a, b) => (Number(a.rank) || 999) - (Number(b.rank) || 999))
+        .map((it, idx) => ({ ...it, rank: idx + 1 }));
+    }
 
     return res.json(data);
   } catch (e) {
@@ -256,12 +274,8 @@ function sanitizeQuestions(raw = []) {
   return raw.map((q, i) => ({
     id: safeText(q?.id) || `q_${i + 1}`,
     text: safeText(q?.text) || "Please share a bit more detail.",
-    type: ["yes_no", "single_choice", "short_text"].includes(q?.type)
-      ? q.type
-      : "short_text",
-    options: Array.isArray(q?.options)
-      ? q.options.map(o => safeText(o)).filter(Boolean)
-      : [],
+    type: ["yes_no", "single_choice", "short_text"].includes(q?.type) ? q.type : "short_text",
+    options: Array.isArray(q?.options) ? q.options.map((o) => safeText(o)).filter(Boolean) : [],
   }));
 }
 
