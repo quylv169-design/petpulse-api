@@ -12,20 +12,15 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // ---------- helpers ----------
 function mustEnv() {
-  if (!OPENAI_API_KEY) {
-    throw new Error("Missing OPENAI_API_KEY env var on Render.");
-  }
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 }
 
 function safeText(v) {
-  if (typeof v !== "string") return "";
-  return v.trim();
+  return typeof v === "string" ? v.trim() : "";
 }
 
 function toInt(v, fallback = null) {
-  if (v === undefined || v === null) return fallback;
-  if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
-  const n = parseInt(String(v).trim(), 10);
+  const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
 }
 
@@ -35,29 +30,24 @@ function clamp(n, min, max) {
 }
 
 function normalizeProfile(p = {}) {
-  const ageYears = p.ageYears ?? p.age_years ?? p.age ?? null;
-  const ageMonths = p.ageMonths ?? p.age_months ?? null;
-
   return {
     petName: safeText(p.petName),
     species: safeText(p.species),
     breed: safeText(p.breed),
     petGender: safeText(p.petGender),
-    ageYears: clamp(toInt(ageYears, null), 0, 50),
-    ageMonths: clamp(toInt(ageMonths, null), 0, 11),
-    weightLb: p.weightLb ?? p.weight_lb ?? "Unknown",
+    ageYears: clamp(toInt(p.ageYears ?? p.age, null), 0, 50),
+    ageMonths: clamp(toInt(p.ageMonths, null), 0, 11),
+    weightLb: p.weightLb ?? "Unknown",
     city: safeText(p.city),
     country: safeText(p.country),
   };
 }
 
-function formatPetAge(yearsRaw, monthsRaw) {
-  if (yearsRaw === null && monthsRaw === null) return "Unknown";
-  const y = yearsRaw ?? 0;
-  const m = monthsRaw ?? 0;
-  if (y === 0 && m > 0) return `${m} months`;
-  if (y > 0 && m === 0) return `${y} years`;
-  return `${y} years ${m} months`;
+function formatPetAge(y, m) {
+  if (y === null && m === null) return "Unknown";
+  if (y > 0 && m > 0) return `${y} years ${m} months`;
+  if (y > 0) return `${y} years`;
+  return `${m} months`;
 }
 
 function profileBlock(p = {}) {
@@ -83,31 +73,14 @@ CONTEXT — WEATHER & ENVIRONMENT
 The pet is located in ${city}, ${country}.
 Today is ${today}.
 
-Consider the typical current weather and seasonal conditions at this location
-(e.g. heat, humidity, rain, cold, seasonal transitions),
-and whether these factors could influence the symptoms below.
+Consider typical current weather and seasonal conditions
+and whether these factors could influence the symptoms.
 `.trim();
 }
 
 // ---------- OpenAI helpers ----------
-async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-mini" }) {
+async function openaiJson({ schemaName, schema, system, user }) {
   mustEnv();
-
-  const body = {
-    model,
-    input: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: schemaName,
-        schema,
-        strict: true,
-      },
-    },
-  };
 
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -115,59 +88,148 @@ async function openaiJson({ schemaName, schema, system, user, model = "gpt-4.1-m
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: schemaName,
+          schema,
+          strict: true,
+        },
+      },
+    }),
   });
 
   const text = await res.text();
   if (!res.ok) throw new Error(text.slice(0, 800));
 
   const json = JSON.parse(text);
-  const outputText = json?.output_text || json?.output?.[0]?.content?.[0]?.text;
-  return JSON.parse(outputText);
+  const out = json?.output_text || json?.output?.[0]?.content?.[0]?.text;
+  return JSON.parse(out);
 }
 
-// ---------- routes ----------
-app.post("/confirm", async (req, res) => {
-  try {
-    const { profile, symptoms, selected_issue_title } = req.body || {};
-    if (!safeText(symptoms)) return res.status(400).json({ error: "Missing symptoms" });
+async function openaiJsonObject({ system, user }) {
+  mustEnv();
 
-    const system = `
-You are a calm veterinary assistant.
-Ask only the minimum necessary follow-up questions.
-No diagnosis. Avoid certainty.
-    `.trim();
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      text: { format: { type: "json_object" } },
+    }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) throw new Error(text.slice(0, 800));
+
+  const json = JSON.parse(text);
+  const out = json?.output_text || json?.output?.[0]?.content?.[0]?.text;
+  return JSON.parse(out);
+}
+
+// ---------- constants ----------
+const STEP1_LEVELS = ["NHE", "TRUNGBINH", "KHA_NANG", "NANG", "KHAN_CAP"];
+
+// ---------- routes ----------
+app.post("/tips", async (req, res) => {
+  try {
+    const { profile, symptoms } = req.body || {};
+    if (!safeText(symptoms)) return res.status(400).json({ error: "Missing symptoms" });
 
     const schema = {
       type: "object",
+      required: ["title", "intro", "issues", "disclaimer"],
       additionalProperties: false,
-      required: ["selected_issue_title", "questions"],
       properties: {
-        selected_issue_title: { type: "string" },
-        questions: {
+        title: { type: "string" },
+        intro: { type: "string" },
+        disclaimer: { type: "string" },
+        issues: {
           type: "array",
-          minItems: 2,
-          maxItems: 4,
           items: {
             type: "object",
-            additionalProperties: false, // 🔴 FIX BẮT BUỘC
-            required: ["id", "text", "type", "options"],
+            required: ["id", "title", "rank", "level", "why", "do_today", "watch"],
+            additionalProperties: false,
             properties: {
               id: { type: "string" },
-              text: { type: "string" },
-              type: { type: "string", enum: ["single_choice", "yes_no", "short_text"] },
-              options: {
-                type: "array",
-                items: { type: "string" },
-              },
+              title: { type: "string" },
+              rank: { type: "integer" },
+              level: { type: "string", enum: STEP1_LEVELS },
+              why: { type: "array", items: { type: "string" } },
+              do_today: { type: "array", items: { type: "string" } },
+              watch: { type: "array", items: { type: "string" } },
             },
           },
         },
       },
     };
 
-    const user = `
-PET PROFILE
+    const data = await openaiJson({
+      schemaName: "step1",
+      schema,
+      system: "You are a calm veterinary assistant.",
+      user: `
+${profileBlock(profile)}
+
+${contextualWeatherBlock(profile)}
+
+OWNER NOTES
+${safeText(symptoms)}
+`,
+    });
+
+    return res.json(data);
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+app.post("/confirm", async (req, res) => {
+  try {
+    const { profile, symptoms, selected_issue_title } = req.body || {};
+    if (!safeText(symptoms)) return res.status(400).json({ error: "Missing symptoms" });
+
+    const schema = {
+      type: "object",
+      required: ["selected_issue_title", "questions"],
+      additionalProperties: false,
+      properties: {
+        selected_issue_title: { type: "string" },
+        questions: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["id", "text", "type", "options"],
+            additionalProperties: false,
+            properties: {
+              id: { type: "string" },
+              text: { type: "string" },
+              type: { type: "string" },
+              options: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+      },
+    };
+
+    const data = await openaiJson({
+      schemaName: "step2",
+      schema,
+      system: "You are a calm veterinary assistant.",
+      user: `
 ${profileBlock(profile)}
 
 ${contextualWeatherBlock(profile)}
@@ -175,18 +237,54 @@ ${contextualWeatherBlock(profile)}
 OWNER NOTES
 ${safeText(symptoms)}
 
-SELECTED POSSIBLE ISSUE
+SELECTED ISSUE
 ${safeText(selected_issue_title)}
-    `.trim();
-
-    const data = await openaiJson({
-      schemaName: "petpulse_step2_questions_v4_fixed",
-      schema,
-      system,
-      user,
+`,
     });
 
-    return res.status(200).json(data);
+    return res.json(data);
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+app.post("/plan", async (req, res) => {
+  try {
+    const {
+      profile,
+      symptoms,
+      selected_issue_title,
+      followup_answers,
+      round,
+      previous_questions,
+      previous_answers,
+    } = req.body || {};
+
+    if (!safeText(symptoms) || !safeText(selected_issue_title)) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const data = await openaiJsonObject({
+      system: "You are a calm veterinary assistant.",
+      user: `
+${profileBlock(profile)}
+
+${contextualWeatherBlock(profile)}
+
+OWNER NOTES
+${safeText(symptoms)}
+
+SELECTED ISSUE
+${safeText(selected_issue_title)}
+
+FOLLOW-UP ROUND: ${round}
+
+ANSWERS
+${JSON.stringify(followup_answers || {}, null, 2)}
+`,
+    });
+
+    return res.json(data);
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
