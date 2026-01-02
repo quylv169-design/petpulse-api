@@ -3,7 +3,6 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -74,6 +73,7 @@ The pet is located in ${city}, ${country}.
 Today is ${today}.
 
 Consider typical current weather and seasonal conditions
+(e.g. heat, humidity, rain, cold, seasonal transitions),
 and whether these factors could influence the symptoms.
 `.trim();
 }
@@ -151,8 +151,8 @@ app.post("/tips", async (req, res) => {
 
     const schema = {
       type: "object",
-      required: ["title", "intro", "issues", "disclaimer"],
       additionalProperties: false,
+      required: ["title", "intro", "issues", "disclaimer"],
       properties: {
         title: { type: "string" },
         intro: { type: "string" },
@@ -161,8 +161,8 @@ app.post("/tips", async (req, res) => {
           type: "array",
           items: {
             type: "object",
-            required: ["id", "title", "rank", "level", "why", "do_today", "watch"],
             additionalProperties: false,
+            required: ["id", "title", "rank", "level", "why", "do_today", "watch"],
             properties: {
               id: { type: "string" },
               title: { type: "string" },
@@ -178,7 +178,7 @@ app.post("/tips", async (req, res) => {
     };
 
     const data = await openaiJson({
-      schemaName: "step1",
+      schemaName: "petpulse_step1",
       schema,
       system: "You are a calm veterinary assistant.",
       user: `
@@ -204,16 +204,16 @@ app.post("/confirm", async (req, res) => {
 
     const schema = {
       type: "object",
-      required: ["selected_issue_title", "questions"],
       additionalProperties: false,
+      required: ["selected_issue_title", "questions"],
       properties: {
         selected_issue_title: { type: "string" },
         questions: {
           type: "array",
           items: {
             type: "object",
-            required: ["id", "text", "type", "options"],
             additionalProperties: false,
+            required: ["id", "text", "type", "options"],
             properties: {
               id: { type: "string" },
               text: { type: "string" },
@@ -226,7 +226,7 @@ app.post("/confirm", async (req, res) => {
     };
 
     const data = await openaiJson({
-      schemaName: "step2",
+      schemaName: "petpulse_step2",
       schema,
       system: "You are a calm veterinary assistant.",
       user: `
@@ -248,6 +248,12 @@ ${safeText(selected_issue_title)}
   }
 });
 
+/**
+ * STEP 3 — /plan
+ * Enforce max 2 rounds:
+ * - round 1: PLAN or NEED_MORE_INFO
+ * - round 2: MUST return PLAN
+ */
 app.post("/plan", async (req, res) => {
   try {
     const {
@@ -260,29 +266,91 @@ app.post("/plan", async (req, res) => {
       previous_answers,
     } = req.body || {};
 
-    if (!safeText(symptoms) || !safeText(selected_issue_title)) {
+    const notes = safeText(symptoms);
+    const issueTitle = safeText(selected_issue_title);
+    const r = Number(round || 1);
+
+    if (!notes || !issueTitle) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const data = await openaiJsonObject({
-      system: "You are a calm veterinary assistant.",
-      user: `
+    if (![1, 2].includes(r)) {
+      return res.status(400).json({ error: "round must be 1 or 2" });
+    }
+
+    const system = `
+You are a calm veterinary assistant.
+No diagnosis. No certainty.
+Decision support only.
+`.trim();
+
+    const user = `
+PET PROFILE
 ${profileBlock(profile)}
 
 ${contextualWeatherBlock(profile)}
 
 OWNER NOTES
-${safeText(symptoms)}
+${notes}
 
-SELECTED ISSUE
-${safeText(selected_issue_title)}
+SELECTED POSSIBLE ISSUE
+${issueTitle}
 
-FOLLOW-UP ROUND: ${round}
+FOLLOW-UP ROUND
+${r}
 
-ANSWERS
+PREVIOUS QUESTIONS
+${JSON.stringify(previous_questions || [], null, 2)}
+
+PREVIOUS ANSWERS
+${JSON.stringify(previous_answers || {}, null, 2)}
+
+CURRENT ANSWERS
 ${JSON.stringify(followup_answers || {}, null, 2)}
-`,
-    });
+
+TASK
+You have two options:
+
+OPTION A — Return a clear action recommendation (result_type="PLAN") with urgency:
+HOME | MONITOR_24H | VET_NOW
+
+OPTION B — If and only if this is round 1 AND information is insufficient,
+ask 2–3 more questions (result_type="NEED_MORE_INFO").
+
+STRICT RULES
+- If round = 2, you MUST return PLAN.
+- No diagnosis. Use cautious language.
+- Return ONLY valid JSON.
+`.trim();
+
+    const data = await openaiJsonObject({ system, user });
+
+    // ---------- ENFORCEMENT ----------
+    if (r === 2 && data?.result_type !== "PLAN") {
+      return res.json({
+        result_type: "PLAN",
+        urgency: "MONITOR_24H",
+        headline: "Monitor closely and consider contacting a vet if symptoms persist",
+        why: [
+          "Some details remain unclear, but there are no immediate red flags.",
+          "Monitoring closely over the next 24 hours is a cautious next step.",
+        ],
+        do_now: [
+          "Ensure your pet has access to fresh water and a quiet place to rest.",
+          "Monitor appetite, energy level, and any vomiting or diarrhea.",
+        ],
+        avoid: [
+          "Avoid giving human medications unless directed by a veterinarian.",
+        ],
+        red_flags: [
+          "Repeated vomiting or inability to keep water down",
+          "Blood in vomit or stool",
+          "Severe lethargy or collapse",
+        ],
+        disclaimer:
+          "This is not a diagnosis. If your pet worsens or you notice red flags, contact a veterinarian promptly.",
+      });
+    }
 
     return res.json(data);
   } catch (e) {
