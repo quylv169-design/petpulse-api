@@ -250,7 +250,6 @@ ${safeText(selected_issue_title)}
 
 /**
  * STEP 3 — /plan
- * FIXED: enforce 2 rounds + sanitize questions
  */
 function sanitizeQuestions(raw = []) {
   if (!Array.isArray(raw)) return [];
@@ -290,6 +289,7 @@ app.post("/plan", async (req, res) => {
 You are a calm veterinary assistant.
 No diagnosis. No certainty.
 Decision support only.
+You MUST return valid JSON.
 If round=2 you MUST return PLAN.
 `.trim();
 
@@ -316,6 +316,9 @@ ${JSON.stringify(previous_answers || {}, null, 2)}
 
 CURRENT ANSWERS
 ${JSON.stringify(followup_answers || {}, null, 2)}
+
+TASK
+Return ONLY valid JSON.
 `.trim();
 
     const data = await openaiJsonObject({ system, user });
