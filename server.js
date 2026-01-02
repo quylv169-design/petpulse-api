@@ -78,6 +78,96 @@ and whether these factors could influence the symptoms.
 `.trim();
 }
 
+function asStringList(v) {
+  if (Array.isArray(v)) {
+    return v
+      .map((x) => safeText(String(x)))
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  if (typeof v === "string") {
+    const s = v.trim();
+    return s ? [s] : [];
+  }
+  return [];
+}
+
+function defaultPlanText(urgency = "MONITOR_24H") {
+  const u = safeText(urgency).toUpperCase();
+
+  if (u === "VET_NOW") {
+    return {
+      headline: "Seek veterinary care as soon as possible",
+      why: [
+        "Some patterns can be more urgent, and it may be safer to have a vet assess your pet.",
+        "Getting help sooner can prevent complications if this worsens quickly.",
+      ],
+      do_now: [
+        "Contact a veterinary clinic or emergency vet now and describe the symptoms clearly.",
+        "Keep your pet calm, warm, and supervised while you prepare to go.",
+        "If vomiting/diarrhea is present, bring a brief timeline (when started, how often).",
+      ],
+      avoid: [
+        "Avoid giving human medications unless a veterinarian instructs you.",
+        "Avoid forcing food or water if your pet is actively vomiting or struggling to swallow.",
+      ],
+      red_flags: [
+        "Collapse, severe weakness, or trouble breathing",
+        "Repeated vomiting or inability to keep water down",
+        "Blood in vomit or stool, or obvious severe pain",
+      ],
+    };
+  }
+
+  if (u === "HOME") {
+    return {
+      headline: "Home care may be appropriate for now",
+      why: [
+        "No clear urgent red flags stand out from what you shared.",
+        "Supportive care and close observation may help while you monitor for changes.",
+      ],
+      do_now: [
+        "Ensure fresh water is available; offer small amounts more often if needed.",
+        "Provide a quiet, comfortable place to rest and keep activity low.",
+        "Track appetite, energy, bathroom changes, and any vomiting/diarrhea.",
+      ],
+      avoid: [
+        "Avoid rich treats/new foods while symptoms are ongoing.",
+        "Avoid human medications unless a veterinarian instructs you.",
+      ],
+      red_flags: [
+        "Symptoms worsen or new symptoms appear",
+        "Your pet becomes very lethargic, painful, or won’t drink",
+        "Any blood in vomit/stool or repeated vomiting",
+      ],
+    };
+  }
+
+  // MONITOR_24H (default)
+  return {
+    headline: "Monitor closely over the next 24 hours",
+    why: [
+      "There don’t appear to be urgent red flags right now, but close monitoring is a cautious next step.",
+      "If anything worsens or doesn’t improve, checking with a vet is the safest move.",
+    ],
+    do_now: [
+      "Ensure your pet has access to fresh water and a calm resting area.",
+      "Monitor appetite, energy, and bathroom habits; note any vomiting/diarrhea.",
+      "Reassess within 24 hours (sooner if red flags appear).",
+    ],
+    avoid: [
+      "Avoid giving human medications unless directed by a veterinarian.",
+      "Avoid strenuous activity until your pet seems back to normal.",
+    ],
+    red_flags: [
+      "Repeated vomiting or inability to keep water down",
+      "Blood in vomit or stool",
+      "Severe lethargy, collapse, or signs of significant pain",
+      "Trouble breathing, bloated abdomen, or repeated unproductive retching",
+    ],
+  };
+}
+
 // ---------- OpenAI helpers ----------
 async function openaiJson({ schemaName, schema, system, user }) {
   mustEnv();
@@ -305,6 +395,10 @@ No diagnosis. No certainty.
 Decision support only.
 You MUST return valid JSON.
 If round=2 you MUST return PLAN.
+
+When returning PLAN:
+- Provide non-empty arrays for: why, do_now, avoid, red_flags (at least 2 each).
+- Keep bullets short and practical.
 `.trim();
 
     const user = `
@@ -333,10 +427,13 @@ ${JSON.stringify(followup_answers || {}, null, 2)}
 
 TASK
 Return ONLY valid JSON.
+If round=1 you may return NEED_MORE_INFO only if truly necessary (2–3 questions max).
+If round=2 you MUST return PLAN.
 `.trim();
 
     const data = await openaiJsonObject({ system, user });
 
+    // If NEED_MORE_INFO is returned, only allow it on round 1 with valid questions
     if (data?.result_type === "NEED_MORE_INFO") {
       const cleanQs = sanitizeQuestions(data.questions);
       if (r === 1 && cleanQs.length > 0) {
@@ -344,21 +441,31 @@ Return ONLY valid JSON.
           result_type: "NEED_MORE_INFO",
           selected_issue_title: issueTitle,
           reason: safeText(data.reason) || "A bit more detail will help.",
-          questions: cleanQs,
+          questions: cleanQs.slice(0, 3),
         });
       }
+      // otherwise fall through to PLAN fallback
     }
+
+    // Normalize PLAN so the app never shows empty sections
+    const urgency = safeText(data?.urgency).toUpperCase() || "MONITOR_24H";
+    const defaults = defaultPlanText(urgency);
+
+    const why = asStringList(data?.why);
+    const doNow = asStringList(data?.do_now);
+    const avoid = asStringList(data?.avoid);
+    const redFlags = asStringList(data?.red_flags);
 
     return res.json({
       result_type: "PLAN",
-      urgency: data?.urgency || "MONITOR_24H",
-      headline: data?.headline || "Monitor closely and consider contacting a vet if needed",
-      why: Array.isArray(data?.why) ? data.why : [],
-      do_now: Array.isArray(data?.do_now) ? data.do_now : [],
-      avoid: Array.isArray(data?.avoid) ? data.avoid : [],
-      red_flags: Array.isArray(data?.red_flags) ? data.red_flags : [],
+      urgency,
+      headline: safeText(data?.headline) || defaults.headline,
+      why: why.length ? why : defaults.why,
+      do_now: doNow.length ? doNow : defaults.do_now,
+      avoid: avoid.length ? avoid : defaults.avoid,
+      red_flags: redFlags.length ? redFlags : defaults.red_flags,
       disclaimer:
-        data?.disclaimer ||
+        safeText(data?.disclaimer) ||
         "This is not a diagnosis. If symptoms worsen or red flags appear, contact a veterinarian.",
     });
   } catch (e) {
